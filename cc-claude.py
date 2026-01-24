@@ -78,32 +78,23 @@ class Colors:
 
 
 class Spinner:
-    """Animated spinner with evolving status text."""
+    """Minimal animated spinner - just the animation, no text."""
 
     # Braille spinner frames for smooth animation
     FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
-    # Status words that cycle for visual interest
-    STATUS_WORDS = [
-        'Connecting', 'Processing', 'Thinking', 'Analyzing',
-        'Working', 'Computing', 'Reasoning', 'Evaluating'
-    ]
-
     def __init__(self):
         self._thread = None
         self._stop_event = threading.Event()
-        self._status = "Processing"
         self._lock = threading.Lock()
         self._visible = False
 
-    def start(self, status="Processing"):
+    def start(self):
         """Start the spinner animation."""
         if self._thread and self._thread.is_alive():
-            self.update(status)
             return
 
         self._stop_event.clear()
-        self._status = status
         self._visible = True
         self._thread = threading.Thread(target=self._animate, daemon=True)
         self._thread.start()
@@ -111,57 +102,26 @@ class Spinner:
     def _animate(self):
         """Animation loop running in background thread."""
         frame_idx = 0
-        word_idx = 0
-        word_timer = 0
 
         while not self._stop_event.is_set():
-            with self._lock:
-                status = self._status
-
-            # Cycle through status words every ~2 seconds if using default
-            if status == "Processing":
-                word_timer += 1
-                if word_timer >= 20:  # 20 * 0.1s = 2 seconds
-                    word_timer = 0
-                    word_idx = (word_idx + 1) % len(self.STATUS_WORDS)
-                    status = self.STATUS_WORDS[word_idx]
-
             frame = self.FRAMES[frame_idx]
-            # \r moves cursor to start of line, \033[K clears to end of line
-            sys.stdout.write(f"\r{Colors.CYAN}{frame} {status}...{Colors.RESET}\033[K")
+            sys.stdout.write(f"\r{Colors.CYAN}{frame}{Colors.RESET}\033[K")
             sys.stdout.flush()
 
             frame_idx = (frame_idx + 1) % len(self.FRAMES)
-            self._stop_event.wait(0.1)
+            self._stop_event.wait(0.08)
 
-    def update(self, status):
-        """Update the status text."""
-        with self._lock:
-            self._status = status
-
-    def stop(self, clear=True):
-        """Stop the spinner and optionally clear the line."""
+    def stop(self):
+        """Stop the spinner and clear the line."""
         if not self._visible:
             return
 
         self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=0.5)
+            self._thread.join(timeout=0.3)
+        self._thread = None
 
-        if clear:
-            # Clear the spinner line
-            sys.stdout.write("\r\033[K")
-            sys.stdout.flush()
-
-        self._visible = False
-
-    def stop_with_message(self, message, color=Colors.GREEN):
-        """Stop spinner and show a final message."""
-        self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=0.5)
-
-        sys.stdout.write(f"\r{color}{message}{Colors.RESET}\033[K\n")
+        sys.stdout.write("\r\033[K")
         sys.stdout.flush()
         self._visible = False
 
@@ -413,11 +373,9 @@ def stream_claude_response(text):
         pending_question = None  # Track if AskUserQuestion was called
 
         # Start spinner while waiting for first response
-        spinner.start("Connecting")
+        spinner.start()
 
         for line in process.stdout:
-            # Stop spinner when we receive any data
-            spinner.stop()
             line = line.strip()
             if not line:
                 continue
@@ -440,6 +398,7 @@ def stream_claude_response(text):
                     block_type = content_block.get('type')
 
                     if block_type == 'thinking':
+                        spinner.stop()
                         progress.stop()
                         progress.reset_group()
                         if in_response:
@@ -451,6 +410,7 @@ def stream_claude_response(text):
                         current_block_type = 'thinking'
 
                     elif block_type == 'text':
+                        spinner.stop()
                         progress.stop()
                         progress.reset_group()
                         if in_thinking:
@@ -501,14 +461,19 @@ def stream_claude_response(text):
                             pending_question = tool_input
 
                         # Format and display tool info
+                        spinner.stop()
                         tool_detail = format_tool_detail(current_tool_name, tool_input)
                         progress.start(tool_detail)
                         # Start spinner while tool executes
-                        spinner.start("Executing")
+                        spinner.start()
                         in_tool = False
+                    elif current_block_type in ('thinking', 'text'):
+                        # Content finished, restart spinner while waiting
+                        spinner.start()
 
                 # Message stop
                 elif inner_type == 'message_stop':
+                    spinner.stop()
                     progress.stop()
                     in_thinking, in_response = close_current_block(in_thinking, in_response)
 
@@ -540,6 +505,9 @@ def stream_claude_response(text):
                                 print(f"{Colors.YELLOW}  ✗ {error_preview}{Colors.RESET}", flush=True)
                             else:
                                 print(f"{Colors.YELLOW}  ✗ Failed{Colors.RESET}", flush=True)
+
+                # Restart spinner while waiting for Claude to continue
+                spinner.start()
 
             # Handle errors
             elif event_type == 'error':
