@@ -139,6 +139,37 @@ model = None
 is_first_message = True  # Track if this is the first message in the session
 cleanup_done = False
 
+# Voice commands - phrases that trigger special actions instead of being sent to Claude
+VOICE_COMMANDS = {
+    'clear context': 'clear',
+    'clear the context': 'clear',
+    'new session': 'clear',
+    'start new session': 'clear',
+    'start over': 'clear',
+    'reset': 'clear',
+    'reset context': 'clear',
+    'reset session': 'clear',
+}
+
+
+def check_voice_command(text):
+    """Check if text matches a voice command. Returns command name or None."""
+    normalized = text.lower().strip().rstrip('.!?')
+    return VOICE_COMMANDS.get(normalized)
+
+
+def handle_voice_command(command):
+    """Execute a voice command. Returns True if handled."""
+    global is_first_message
+
+    if command == 'clear':
+        is_first_message = True
+        print(f"\n{Colors.GREEN}✓ Context cleared. Starting fresh session.{Colors.RESET}")
+        print(f"{Colors.DIM}─────────────────────────────────────────────────{Colors.RESET}")
+        return True
+
+    return False
+
 
 class ToolPrinter:
     """Simple tool output."""
@@ -725,9 +756,15 @@ def stop_recording():
     os.unlink(temp_path)
 
     if text:
-        send_to_claude(text)  # Response is already printed via streaming
-        print()
-        print(f"{Colors.DIM}─────────────────────────────────────────────────{Colors.RESET}")
+        # Check for voice commands first
+        command = check_voice_command(text)
+        if command:
+            print(f"{Colors.DIM}> {text}{Colors.RESET}")
+            handle_voice_command(command)
+        else:
+            send_to_claude(text)  # Response is already printed via streaming
+            print()
+            print(f"{Colors.DIM}─────────────────────────────────────────────────{Colors.RESET}")
         print(f"{Colors.DIM}Ready. Press Space to record.{Colors.RESET}")
     else:
         print(f"{Colors.DIM}No speech detected{Colors.RESET}")
