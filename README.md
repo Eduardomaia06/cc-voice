@@ -1,6 +1,6 @@
 # cc-voice
 
-A hands-free voice interface for Claude Code. Speak your instructions, have them transcribed via Whisper (GPU-accelerated), sent to Claude CLI, and see streaming responses with formatted thinking/tool usage.
+A hands-free voice interface for Claude Code. Speak your instructions, have them transcribed via Whisper (GPU-accelerated with CUDA), sent to Claude CLI, and see streaming responses with formatted thinking/tool usage.
 
 ## Features
 
@@ -8,8 +8,10 @@ A hands-free voice interface for Claude Code. Speak your instructions, have them
 - **GPU-accelerated transcription**: Uses faster-whisper with CUDA for fast, accurate speech recognition
 - **Streaming output**: See Claude's thinking, responses, and tool usage in real-time
 - **Conversation continuity**: Maintains context across multiple voice inputs (uses `--continue`)
+- **Push-to-talk interrupt**: Press Space anytime during Claude's response to interrupt and speak
+- **Voice commands**: Say "clear context", "new session", or "reset" to start fresh
 - **Project-aware**: Point cc-voice at any project folder to load its `CLAUDE.md` and `.mcp.json` settings
-- **Interactive questions**: When Claude asks a question, record your voice response
+- **Interactive questions**: When Claude asks a question (AskUserQuestion), record your voice response
 
 ## Requirements
 
@@ -18,7 +20,7 @@ A hands-free voice interface for Claude Code. Speak your instructions, have them
 - Microphone
 
 ### Software
-- Windows 10/11
+- Windows 10/11 (also works on Linux with minor adjustments)
 - Python 3.10+
 - Claude CLI installed and in PATH (`npm install -g @anthropic-ai/claude-code`)
 - CUDA Toolkit 12.x and cuDNN
@@ -39,6 +41,11 @@ python -m venv venv
 ```powershell
 pip install faster-whisper sounddevice numpy
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+Optional (for better Windows terminal color support):
+```powershell
+pip install colorama
 ```
 
 ### 3. Install CUDA Toolkit
@@ -62,10 +69,11 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 ### 5. Verify CUDA is working
 
 ```powershell
-python -c "import torch; print(torch.cuda.is_available())"
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+python -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}')"
 ```
 
-Should print `True`.
+Should print `CUDA available: True` and your GPU name.
 
 ### 6. Verify Claude CLI is installed
 
@@ -116,21 +124,39 @@ This is the easiest way to use cc-voice with multiple projects.
 | Key | Action |
 |-----|--------|
 | **Space** | Toggle recording (press to start, press again to stop) |
+| **Space** (during response) | Interrupt Claude and record new input |
 | **Ctrl+C** | Exit the application |
+
+## Voice Commands
+
+Say these phrases to trigger special actions (instead of sending to Claude):
+
+| Voice Command | Action |
+|---------------|--------|
+| "clear context" | Start a new conversation session |
+| "clear the context" | Start a new conversation session |
+| "new session" | Start a new conversation session |
+| "start new session" | Start a new conversation session |
+| "start over" | Start a new conversation session |
+| "reset" | Start a new conversation session |
+| "reset context" | Start a new conversation session |
+| "reset session" | Start a new conversation session |
 
 ## How it works
 
 1. Press **Space** to start recording your voice
 2. Speak your instruction or question
 3. Press **Space** to stop recording
-4. Whisper transcribes your speech (GPU-accelerated)
+4. Whisper transcribes your speech (GPU-accelerated via CUDA with float16 precision)
 5. Transcription is sent to Claude CLI with `--continue` to maintain conversation context
 6. Claude's response streams back with:
    - Thinking shown in dim cyan italic
    - Tool usage shown with progress indicators
    - Final response in bright white
-7. When Claude uses `AskUserQuestion`, you can record a voice response
-8. Repeat from step 1 for follow-up messages
+   - Stats shown at end (duration, tool count, cost)
+7. **Interrupt anytime**: Press Space during Claude's response to interrupt and speak
+8. When Claude uses `AskUserQuestion`, you can record a voice response
+9. Repeat from step 1 for follow-up messages
 
 ## Configuration
 
@@ -138,7 +164,7 @@ Edit `cc-claude.py` to change:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `WHISPER_MODEL` | `large-v3` | Whisper model size |
+| `WHISPER_MODEL` | `large-v3` | Whisper model size (see table below) |
 | `SAMPLE_RATE` | `16000` | Audio sample rate in Hz |
 | `CLAUDE_TIMEOUT` | `3600` | Max seconds to wait for Claude (1 hour) |
 
@@ -152,7 +178,42 @@ Edit `cc-claude.py` to change:
 | medium.en | ~3GB | Slower | Very Good |
 | large-v3 | ~4GB | Slowest | Best |
 
-For an RTX 3060 (12GB), `large-v3` runs comfortably.
+For an RTX 3060 (12GB), `large-v3` runs comfortably with room to spare.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         cc-claude.py                            │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Audio Recording (sounddevice)                               │
+│     └─> Captures microphone input while Space is held          │
+│                                                                 │
+│  2. Speech-to-Text (faster-whisper + CUDA)                      │
+│     └─> GPU-accelerated transcription with VAD filtering       │
+│                                                                 │
+│  3. Voice Command Detection                                     │
+│     └─> Checks for "clear context", "reset", etc.              │
+│                                                                 │
+│  4. Claude Integration                                          │
+│     └─> Sends to Claude CLI with --continue for context        │
+│     └─> Streams JSON output for real-time display              │
+│     └─> Handles tool use, thinking, and responses              │
+│                                                                 │
+│  5. Interactive Q&A                                             │
+│     └─> When Claude asks questions, prompts for voice input    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `cc-claude.py` | Main application - voice interface for Claude |
+| `run.bat` | Windows launcher script (handles venv activation) |
+| `run-project.bat` | Portable launcher to copy into project folders |
+| `CLAUDE.md` | Instructions for Claude when working on this codebase |
+| `piper/` | Piper TTS files (included but not currently used) |
 
 ## Troubleshooting
 
@@ -163,10 +224,27 @@ Make sure Claude is installed globally: `npm install -g @anthropic-ai/claude-cod
 - Verify CUDA: `python -c "import torch; print(torch.cuda.is_available())"`
 - Check GPU drivers are up to date
 - Ensure cuDNN files are in the correct CUDA directories
+- Make sure no other process is using all GPU memory
 
 ### No audio input
 - Check your microphone is set as default recording device in Windows
 - Try running as administrator
+- Verify sounddevice sees your mic: `python -c "import sounddevice; print(sounddevice.query_devices())"`
 
 ### Window closes immediately
 If using `run-project.bat` and it closes immediately, there may be an error. The script includes a `pause` command so you can see any error messages.
+
+### Transcription quality issues
+- Try a larger Whisper model (e.g., `large-v3` instead of `small.en`)
+- Ensure you have a good microphone
+- Reduce background noise
+- Speak clearly and at a moderate pace
+
+### High GPU memory usage
+- Use a smaller Whisper model (`small.en` uses ~2GB vs `large-v3` at ~4GB)
+- Close other GPU-intensive applications
+- The model is loaded once at startup and reused for efficiency
+
+## License
+
+MIT
