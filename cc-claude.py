@@ -371,6 +371,7 @@ def stream_claude_response(text):
         current_tool_name = ""
         current_tool_input_json = ""
         pending_question = None  # Track if AskUserQuestion was called
+        got_result = False  # Track if we received a proper result event
 
         # Start spinner while waiting for first response
         spinner.start()
@@ -421,9 +422,11 @@ def stream_claude_response(text):
                         current_block_type = 'text'
 
                     elif block_type == 'tool_use':
+                        spinner.stop()
                         progress.stop()
-                        # Close any open blocks
+                        # Close any open blocks and ensure newline before tool output
                         if in_thinking or in_response:
+                            print()  # Ensure we're on a new line
                             in_thinking, in_response = close_current_block(in_thinking, in_response)
                         current_tool_name = content_block.get('name', 'Unknown')
                         current_tool_input_json = ""
@@ -468,7 +471,8 @@ def stream_claude_response(text):
                         spinner.start()
                         in_tool = False
                     elif current_block_type in ('thinking', 'text'):
-                        # Content finished, restart spinner while waiting
+                        # Content finished, move to new line before spinner to avoid overwriting
+                        print()
                         spinner.start()
 
                 # Message stop
@@ -520,6 +524,7 @@ def stream_claude_response(text):
             elif event_type == 'result':
                 spinner.stop()
                 progress.stop()
+                got_result = True
                 # Close any remaining open blocks
                 in_thinking, in_response = close_current_block(in_thinking, in_response)
 
@@ -552,6 +557,14 @@ def stream_claude_response(text):
         spinner.stop()  # Ensure spinner is stopped
         process.wait()  # No timeout - wait indefinitely
         is_first_message = False
+
+        # Check if stream ended unexpectedly
+        if not got_result:
+            exit_code = process.returncode
+            if exit_code != 0:
+                print(f"\n{Colors.YELLOW}⚠ Claude process exited with code {exit_code}{Colors.RESET}")
+            else:
+                print(f"\n{Colors.DIM}[Stream ended without result]{Colors.RESET}")
 
         # Handle pending question if AskUserQuestion was called
         if pending_question:
@@ -588,11 +601,13 @@ def stream_claude_response(text):
     except FileNotFoundError:
         spinner.stop()
         progress.stop()
-        return "[Error: Claude CLI not found. Make sure 'claude' is in PATH]"
+        print(f"\n{Colors.YELLOW}⚠ Error: Claude CLI not found. Make sure 'claude' is in PATH{Colors.RESET}")
+        return ""
     except Exception as e:
         spinner.stop()
         progress.stop()
-        return f"[Error: {str(e)}]"
+        print(f"\n{Colors.YELLOW}⚠ Error: {str(e)}{Colors.RESET}")
+        return ""
 
 
 def record_response_sync():
