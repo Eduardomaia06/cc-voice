@@ -14,6 +14,7 @@ import signal
 import atexit
 import gc
 import time
+import threading
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
@@ -74,6 +75,99 @@ class Colors:
     THINKING = "\033[2;3;36m"  # Dim + Italic + Cyan for thinking content
     RESPONSE = "\033[0;97m"    # Reset + Bright white for response
     TOOL = "\033[2;35m"        # Dim + Magenta for tool info
+
+
+class Spinner:
+    """Animated spinner with evolving status text."""
+
+    # Braille spinner frames for smooth animation
+    FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+    # Status words that cycle for visual interest
+    STATUS_WORDS = [
+        'Connecting', 'Processing', 'Thinking', 'Analyzing',
+        'Working', 'Computing', 'Reasoning', 'Evaluating'
+    ]
+
+    def __init__(self):
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._status = "Processing"
+        self._lock = threading.Lock()
+        self._visible = False
+
+    def start(self, status="Processing"):
+        """Start the spinner animation."""
+        if self._thread and self._thread.is_alive():
+            self.update(status)
+            return
+
+        self._stop_event.clear()
+        self._status = status
+        self._visible = True
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._thread.start()
+
+    def _animate(self):
+        """Animation loop running in background thread."""
+        frame_idx = 0
+        word_idx = 0
+        word_timer = 0
+
+        while not self._stop_event.is_set():
+            with self._lock:
+                status = self._status
+
+            # Cycle through status words every ~2 seconds if using default
+            if status == "Processing":
+                word_timer += 1
+                if word_timer >= 20:  # 20 * 0.1s = 2 seconds
+                    word_timer = 0
+                    word_idx = (word_idx + 1) % len(self.STATUS_WORDS)
+                    status = self.STATUS_WORDS[word_idx]
+
+            frame = self.FRAMES[frame_idx]
+            # \r moves cursor to start of line, \033[K clears to end of line
+            sys.stdout.write(f"\r{Colors.CYAN}{frame} {status}...{Colors.RESET}\033[K")
+            sys.stdout.flush()
+
+            frame_idx = (frame_idx + 1) % len(self.FRAMES)
+            self._stop_event.wait(0.1)
+
+    def update(self, status):
+        """Update the status text."""
+        with self._lock:
+            self._status = status
+
+    def stop(self, clear=True):
+        """Stop the spinner and optionally clear the line."""
+        if not self._visible:
+            return
+
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+
+        if clear:
+            # Clear the spinner line
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+        self._visible = False
+
+    def stop_with_message(self, message, color=Colors.GREEN):
+        """Stop spinner and show a final message."""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+
+        sys.stdout.write(f"\r{color}{message}{Colors.RESET}\033[K\n")
+        sys.stdout.flush()
+        self._visible = False
+
+
+# Global spinner instance
+spinner = Spinner()
 
 # State
 recording = False
@@ -178,6 +272,31 @@ def close_current_block(in_thinking, in_response):
     if in_thinking or in_response:
         print(f"{Colors.RESET}", end="", flush=True)  # Just reset colors
     return False, False
+
+
+def format_ask_user_question(tool_input):
+    """Format and display an AskUserQuestion for the user to respond to."""
+    questions = tool_input.get('questions', [])
+    if not questions:
+        return "Claude has a question for you."
+
+    lines = []
+    for i, q in enumerate(questions):
+        question_text = q.get('question', 'Question?')
+        options = q.get('options', [])
+
+        lines.append(f"\n{Colors.CYAN}❓ {question_text}{Colors.RESET}")
+
+        if options:
+            for j, opt in enumerate(options, 1):
+                label = opt.get('label', f'Option {j}')
+                desc = opt.get('description', '')
+                if desc:
+                    lines.append(f"   {Colors.WHITE}{j}. {label}{Colors.RESET} - {Colors.DIM}{desc}{Colors.RESET}")
+                else:
+                    lines.append(f"   {Colors.WHITE}{j}. {label}{Colors.RESET}")
+
+    return '\n'.join(lines)
 
 
 def format_tool_detail(tool_name, tool_input):
@@ -291,8 +410,14 @@ def stream_claude_response(text):
         tool_count = 0
         current_tool_name = ""
         current_tool_input_json = ""
+        pending_question = None  # Track if AskUserQuestion was called
+
+        # Start spinner while waiting for first response
+        spinner.start("Connecting")
 
         for line in process.stdout:
+            # Stop spinner when we receive any data
+            spinner.stop()
             line = line.strip()
             if not line:
                 continue
@@ -371,9 +496,15 @@ def stream_claude_response(text):
                         except json.JSONDecodeError:
                             tool_input = {}
 
+                        # Track AskUserQuestion for later handling
+                        if current_tool_name == 'AskUserQuestion':
+                            pending_question = tool_input
+
                         # Format and display tool info
                         tool_detail = format_tool_detail(current_tool_name, tool_input)
                         progress.start(tool_detail)
+                        # Start spinner while tool executes
+                        spinner.start("Executing")
                         in_tool = False
 
                 # Message stop
@@ -392,6 +523,7 @@ def stream_claude_response(text):
 
             # Handle user message (tool results being fed back)
             elif event_type == 'user':
+                spinner.stop()
                 progress.complete()
 
                 message = event.get('message', {})
@@ -411,12 +543,14 @@ def stream_claude_response(text):
 
             # Handle errors
             elif event_type == 'error':
+                spinner.stop()
                 progress.stop()
                 error_msg = event.get('error', {}).get('message', 'Unknown error')
                 print(f"\n{Colors.YELLOW}⚠ Error: {error_msg}{Colors.RESET}")
 
             # Handle result event (final summary)
             elif event_type == 'result':
+                spinner.stop()
                 progress.stop()
                 # Close any remaining open blocks
                 in_thinking, in_response = close_current_block(in_thinking, in_response)
@@ -447,12 +581,34 @@ def stream_claude_response(text):
                 if stats:
                     print(f"\n{Colors.DIM}[{' · '.join(stats)}]{Colors.RESET}")
 
+        spinner.stop()  # Ensure spinner is stopped
         process.wait()  # No timeout - wait indefinitely
         is_first_message = False
+
+        # Handle pending question if AskUserQuestion was called
+        if pending_question:
+            question_display = format_ask_user_question(pending_question)
+            print(question_display)
+            print(f"\n{Colors.DIM}Press Space to record your answer...{Colors.RESET}")
+
+            # Wait for space to start recording
+            while True:
+                key = wait_for_key()
+                if key == b' ':
+                    break
+                elif key == b'\x03':  # Ctrl+C
+                    return ''.join(response_text) if response_text else ""
+
+            # Record and transcribe user response
+            user_answer = record_response_sync()
+            if user_answer:
+                # Send answer as follow-up message (will use --continue)
+                return stream_claude_response(user_answer)
 
         return ''.join(response_text) if response_text else ""
 
     except KeyboardInterrupt:
+        spinner.stop()
         progress.stop()
         print(f"\n{Colors.YELLOW}Cancelled by user{Colors.RESET}")
         process.terminate()
@@ -462,11 +618,68 @@ def stream_claude_response(text):
             process.kill()
         return "[Cancelled]"
     except FileNotFoundError:
+        spinner.stop()
         progress.stop()
         return "[Error: Claude CLI not found. Make sure 'claude' is in PATH]"
     except Exception as e:
+        spinner.stop()
         progress.stop()
         return f"[Error: {str(e)}]"
+
+
+def record_response_sync():
+    """Record audio synchronously and return transcribed text. Used for answering questions."""
+    print(f"{Colors.YELLOW}● Recording answer...{Colors.RESET} (Space to stop)")
+
+    audio_chunks = []
+    is_recording = True
+
+    def callback(indata, frames, time_info, status):
+        if is_recording:
+            audio_chunks.append(indata.copy())
+
+    rec_stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype=np.float32, callback=callback)
+    rec_stream.start()
+
+    # Wait for Space to stop
+    while True:
+        key = wait_for_key()
+        if key == b' ':
+            break
+        elif key == b'\x03':  # Ctrl+C
+            rec_stream.stop()
+            rec_stream.close()
+            return None
+
+    is_recording = False
+    rec_stream.stop()
+    rec_stream.close()
+
+    if len(audio_chunks) < 10:
+        print(f"{Colors.DIM}Recording too short{Colors.RESET}")
+        return ""
+
+    audio = np.concatenate(audio_chunks, axis=0)
+
+    # Save temp wav
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        temp_path = f.name
+        with wave.open(f.name, 'wb') as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(SAMPLE_RATE)
+            wav.writeframes((audio * 32767).astype(np.int16).tobytes())
+
+    # Transcribe
+    print(f"{Colors.DIM}Transcribing...{Colors.RESET}")
+    segments, _ = model.transcribe(temp_path, beam_size=5, vad_filter=True, language="en")
+    text = " ".join(s.text for s in segments).strip()
+    os.unlink(temp_path)
+
+    if text:
+        print(f"{Colors.GREEN}> {text}{Colors.RESET}")
+
+    return text
 
 
 def send_to_claude(text):
