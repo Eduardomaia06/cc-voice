@@ -12,7 +12,11 @@ for /f "tokens=2" %%i in ('tasklist /fi "imagename eq python.exe" /fo list ^| fi
 
 :: Activate venv and run
 call venv\Scripts\activate
-python cc-claude.py
+if "%~1"=="" (
+    python cc-claude.py
+) else (
+    python cc-claude.py --project "%~1"
+)
 
 :: Cleanup on exit - kill any remaining child processes
 taskkill /f /im python.exe /fi "WINDOWTITLE eq *cc-claude*" >nul 2>&1

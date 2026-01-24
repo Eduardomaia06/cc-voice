@@ -15,6 +15,7 @@ import atexit
 import gc
 import time
 import threading
+import argparse
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
@@ -58,6 +59,7 @@ if sys.platform == 'win32':
 WHISPER_MODEL = "large-v3"
 SAMPLE_RATE = 16000
 CLAUDE_TIMEOUT = 3600  # seconds (1 hour for very long tasks)
+PROJECT_DIR = None  # Set via --project argument; Claude runs in this directory
 
 # ANSI color codes for terminal formatting
 class Colors:
@@ -356,6 +358,7 @@ def stream_claude_response(text):
 
         process = subprocess.Popen(
             cmd,
+            cwd=PROJECT_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -736,6 +739,23 @@ def toggle_recording():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Voice interface for Claude Code")
+    parser.add_argument(
+        '--project', '-C',
+        type=str,
+        default=None,
+        help="Project directory for Claude to run in (loads CLAUDE.md, .mcp.json from there)"
+    )
+    args = parser.parse_args()
+
+    # Set project directory
+    if args.project:
+        PROJECT_DIR = os.path.abspath(args.project)
+        if not os.path.isdir(PROJECT_DIR):
+            print(f"{Colors.YELLOW}⚠ Error: Project directory does not exist: {PROJECT_DIR}{Colors.RESET}")
+            sys.exit(1)
+        print(f"{Colors.DIM}Project: {PROJECT_DIR}{Colors.RESET}")
+
     print(f"{Colors.DIM}Loading Whisper model...{Colors.RESET}")
     model = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
     print(f"{Colors.GREEN}Ready.{Colors.RESET} Press {Colors.WHITE}Space{Colors.RESET} to record, {Colors.WHITE}Ctrl+C{Colors.RESET} to exit.")
