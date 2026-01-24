@@ -16,6 +16,7 @@ import gc
 import time
 import threading
 import argparse
+import queue
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
@@ -31,9 +32,16 @@ if sys.platform == 'win32':
     def key_pressed():
         """Check if a key is pressed (non-blocking)."""
         return msvcrt.kbhit()
+
+    def get_key_nonblocking():
+        """Get key if pressed, None otherwise (non-blocking)."""
+        if msvcrt.kbhit():
+            return msvcrt.getch()
+        return None
 else:
     import termios
     import tty
+    import select
 
     def wait_for_key():
         """Wait for any key press."""
@@ -42,6 +50,22 @@ else:
         try:
             tty.setraw(fd)
             return sys.stdin.read(1).encode()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def key_pressed():
+        """Check if a key is pressed (non-blocking)."""
+        return select.select([sys.stdin], [], [], 0)[0]
+
+    def get_key_nonblocking():
+        """Get key if pressed, None otherwise (non-blocking)."""
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            if select.select([sys.stdin], [], [], 0)[0]:
+                return sys.stdin.read(1).encode()
+            return None
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
@@ -369,10 +393,20 @@ def format_tool_detail(tool_name, tool_input):
         return f"Using: {tool_name}"
 
 
-def stream_claude_response(text):
-    """Send text to Claude CLI and stream response with formatted thinking/response."""
+def stream_claude_response(text, interrupted_from=None):
+    """Send text to Claude CLI and stream response with formatted thinking/response.
+
+    Args:
+        text: The text to send to Claude
+        interrupted_from: If this is an interrupt, contains info about the interrupted response
+
+    Returns:
+        Tuple of (response_text, was_interrupted, interrupt_text)
+    """
     global is_first_message
 
+    if interrupted_from:
+        print(f"\n{Colors.CYAN}[Interrupted]{Colors.RESET}")
     print(f"\n{Colors.YELLOW}> {text}{Colors.RESET}\n")
 
     try:
@@ -384,7 +418,8 @@ def stream_claude_response(text):
             '--verbose',
             '--include-partial-messages'
         ]
-        if not is_first_message:
+        # Always continue if we've had messages OR if this is an interrupt
+        if not is_first_message or interrupted_from:
             cmd.insert(1, '--continue')
 
         process = subprocess.Popen(
@@ -408,11 +443,59 @@ def stream_claude_response(text):
         current_tool_input_json = ""
         pending_question = None  # Track if AskUserQuestion was called
         got_result = False  # Track if we received a proper result event
+        was_interrupted = False  # Track if user interrupted with Space
+        interrupt_text = None  # Text from interrupt recording
 
         # Start spinner while waiting for first response
         spinner.start()
 
-        for line in process.stdout:
+        # Use a thread to read stdout so we can check for interrupts
+        line_queue = queue.Queue()
+        read_done = threading.Event()
+
+        def read_stdout():
+            try:
+                for line in process.stdout:
+                    line_queue.put(line)
+            finally:
+                read_done.set()
+
+        reader_thread = threading.Thread(target=read_stdout, daemon=True)
+        reader_thread.start()
+
+        while not read_done.is_set() or not line_queue.empty():
+            # Check for interrupt (Space key)
+            key = get_key_nonblocking()
+            if key == b' ':
+                # User wants to interrupt - stop Claude and record new input
+                spinner.stop()
+                progress.stop()
+                in_thinking, in_response = close_current_block(in_thinking, in_response)
+
+                print(f"\n{Colors.DIM}Interrupting...{Colors.RESET}")
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except:
+                    process.kill()
+
+                # Record the interrupt
+                interrupt_text = record_response_sync()
+                was_interrupted = True
+                is_first_message = False  # We've had interaction
+                break
+
+            elif key == b'\x03':  # Ctrl+C
+                spinner.stop()
+                progress.stop()
+                process.terminate()
+                return (''.join(response_text), False, None)
+
+            # Try to get a line from the queue
+            try:
+                line = line_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
             line = line.strip()
             if not line:
                 continue
@@ -591,11 +674,16 @@ def stream_claude_response(text):
                     print(f"\n{Colors.DIM}[{' · '.join(stats)}]{Colors.RESET}")
 
         spinner.stop()  # Ensure spinner is stopped
+
+        # If we were interrupted, handle it
+        if was_interrupted and interrupt_text:
+            return (''.join(response_text), True, interrupt_text)
+
         process.wait()  # No timeout - wait indefinitely
         is_first_message = False
 
         # Check if stream ended unexpectedly
-        if not got_result:
+        if not got_result and not was_interrupted:
             exit_code = process.returncode
             if exit_code != 0:
                 print(f"\n{Colors.YELLOW}⚠ Claude process exited with code {exit_code}{Colors.RESET}")
@@ -603,7 +691,7 @@ def stream_claude_response(text):
                 print(f"\n{Colors.DIM}[Stream ended without result]{Colors.RESET}")
 
         # Handle pending question if AskUserQuestion was called
-        if pending_question:
+        if pending_question and not was_interrupted:
             question_display = format_ask_user_question(pending_question)
             print(question_display)
             print(f"\n{Colors.DIM}Press Space to record your answer...{Colors.RESET}")
@@ -614,7 +702,7 @@ def stream_claude_response(text):
                 if key == b' ':
                     break
                 elif key == b'\x03':  # Ctrl+C
-                    return ''.join(response_text) if response_text else ""
+                    return (''.join(response_text), False, None)
 
             # Record and transcribe user response
             user_answer = record_response_sync()
@@ -622,7 +710,7 @@ def stream_claude_response(text):
                 # Send answer as follow-up message (will use --continue)
                 return stream_claude_response(user_answer)
 
-        return ''.join(response_text) if response_text else ""
+        return (''.join(response_text), False, None)
 
     except KeyboardInterrupt:
         spinner.stop()
@@ -633,17 +721,17 @@ def stream_claude_response(text):
             process.wait(timeout=5)
         except:
             process.kill()
-        return "[Cancelled]"
+        return ("[Cancelled]", False, None)
     except FileNotFoundError:
         spinner.stop()
         progress.stop()
         print(f"\n{Colors.YELLOW}⚠ Error: Claude CLI not found. Make sure 'claude' is in PATH{Colors.RESET}")
-        return ""
+        return ("", False, None)
     except Exception as e:
         spinner.stop()
         progress.stop()
         print(f"\n{Colors.YELLOW}⚠ Error: {str(e)}{Colors.RESET}")
-        return ""
+        return ("", False, None)
 
 
 def record_response_sync():
@@ -702,8 +790,22 @@ def record_response_sync():
 
 
 def send_to_claude(text):
-    """Send text to Claude CLI with streaming response."""
-    return stream_claude_response(text)
+    """Send text to Claude CLI with streaming response. Handles interrupts."""
+    current_text = text
+    interrupted_from = None
+
+    while True:
+        response, was_interrupted, interrupt_text = stream_claude_response(
+            current_text, interrupted_from=interrupted_from
+        )
+
+        if was_interrupted and interrupt_text:
+            # User interrupted - send the new message
+            current_text = interrupt_text
+            interrupted_from = response
+        else:
+            # Normal completion
+            return response
 
 
 def start_recording():
@@ -799,6 +901,7 @@ if __name__ == "__main__":
     model = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
     print(f"{Colors.GREEN}Ready.{Colors.RESET} Press {Colors.WHITE}Space{Colors.RESET} to record, {Colors.WHITE}Ctrl+C{Colors.RESET} to exit.")
     print(f"{Colors.DIM}Conversation context maintained until exit.{Colors.RESET}")
+    print(f"{Colors.DIM}Press Space anytime during response to interrupt and speak.{Colors.RESET}")
     print()
 
     try:
